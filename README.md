@@ -1,46 +1,98 @@
-# BuzzController
+# BuzzCast
 
-Comandos **Buzz!** virtuais no telemóvel para o **PCSX2**. Cada jogador abre o
-browser, escolhe um lugar e carrega nos botões (vermelho grande + azul, laranja,
-verde, amarelo) — tal como na campainha física. Suporta **8 jogadores**.
+Turn any phone into a **Buzz!** quiz controller for **PCSX2**. Players open a browser, pick a slot (1–8) and tap the buttons — just like the real plastic buzzers. Supports up to **8 players**.
 
-A app corre no PC, serve uma webapp na rede local e emula um **teclado**. O PCSX2
-não distingue isto de um teclado real: basta mapear cada Pad Buzz às teclas abaixo.
+BuzzCast runs on the host PC, serves a web app on the local network, and emulates a **keyboard**. PCSX2 can't tell the difference from a real keyboard — you just map each Buzz pad to the keys below.
 
-> ⚠️ **A janela do PCSX2 tem de estar EM FOCO** para receber as teclas.
+> ⚠️ **The PCSX2 window must be in focus** to receive key presses.
 
 ---
 
-## Como funciona
+## How it works
 
 ```
-Telemóvel (browser) ──WebSocket/WiFi──► App no PC ──emula teclado──► PCSX2
+Phone (browser) ──WebSocket──► BuzzCast on PC ──keyboard emulation──► PCSX2
 ```
 
-## Pré-requisitos
+---
 
-- [Node.js](https://nodejs.org) instalado no PC.
-- Telemóveis e PC na **mesma rede WiFi**.
-- A firewall do Windows tem de permitir a porta **3000** (na 1ª vez o Windows
-  pergunta — autoriza em "Redes privadas").
+## Requirements
 
-## Arrancar
+- **Windows PC** running PCSX2 with a Buzz! game.
+- Phones on the **same WiFi** as the PC (for local play).
+- No installs needed on phones — just a browser.
+
+> **No Node.js or Bun required.** `BuzzCast.exe` is a standalone executable that includes its own runtime. Just double-click and play.
+
+---
+
+## Getting started
+
+### Option A — Download the exe *(easiest)*
+
+Download `BuzzCast.exe` from [Releases](https://github.com/bacoinz/buzz-cast/releases), double-click it and a browser tab opens automatically.
+
+### Option B — Run from source
 
 ```sh
 npm install
-npm start
+node server.js
 ```
 
-O terminal mostra um **QR code** e o endereço (ex.: `http://192.168.1.50:3000`).
-Cada jogador aponta a câmara do telemóvel ao QR, escolhe um lugar livre e está
-pronto. No PC podes testar em `http://localhost:3000`.
+Or with Bun:
+```sh
+bun run bun-server.js
+```
 
-## Mapeamento de teclas (copiar para o PCSX2)
+### Build the exe yourself
 
-Definido em [`config.js`](config.js). 8 jogadores × 5 botões = 40 teclas únicas.
+Requires [Bun](https://bun.sh) installed:
 
-| Jogador | Buzzer (vermelho) | Azul | Laranja | Verde | Amarelo |
-|--------:|:-----------------:|:----:|:-------:|:-----:|:-------:|
+```sh
+bun run build.js
+```
+
+Outputs `BuzzCast.exe` (~95 MB standalone, no dependencies).
+
+---
+
+## Playing locally (same WiFi)
+
+1. Run `BuzzCast.exe` — the **Host** page opens automatically.
+2. Players scan the **Local QR code** with their phone camera, or type the URL shown.
+3. Each player picks a free slot and enters their name.
+4. The controller screen appears — ready to play!
+
+---
+
+## Playing remotely (online / streaming)
+
+BuzzCast supports **online multiplayer** via [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) — no account or port forwarding required.
+
+This works great with any screen-sharing or streaming app:
+
+| Scenario | How |
+|---|---|
+| **Discord / Parsec / Moonlight stream** | Host shares their screen. Remote players use their own phone to open the BuzzCast Remote URL. |
+| **Playing across the internet** | Same as above — the Cloudflare tunnel gives remote players a public HTTPS link. |
+
+### Setup
+
+1. In the **Host** page, click the **Remote** tab.
+2. If Cloudflare isn't detected, click **Install** — BuzzCast downloads it silently (~35 MB, no admin rights needed). You can uninstall it later from the same tab.
+3. Once the tunnel starts, a QR code and a `https://…trycloudflare.com` URL appear.
+4. Remote players open that URL on their phones — they join the **same lobby** as local players.
+
+> The host streams their screen via Discord/Parsec/etc. while remote players control Buzz! from their own phones using the tunnel URL.
+
+---
+
+## PCSX2 key map
+
+Defined in [`config.js`](config.js). 8 players × 5 buttons = 40 unique keys.
+
+| Player | Buzzer (●) | Blue | Orange | Green | Yellow |
+|-------:|:----------:|:----:|:------:|:-----:|:------:|
 | 1 | Q | W | E | R | T |
 | 2 | A | S | D | F | G |
 | 3 | Z | X | C | V | B |
@@ -48,24 +100,29 @@ Definido em [`config.js`](config.js). 8 jogadores × 5 botões = 40 teclas únic
 | 5 | H | J | K | L | N |
 | 6 | Num1 | Num2 | Num3 | Num4 | Num5 |
 | 7 | Num6 | Num7 | Num8 | Num9 | Num0 |
-| 8 | F | M | , | . | / |
+| 8 | M | F | , | . | / |
 
-`Num1`–`Num0` = teclas do **teclado numérico** (numpad).
+`Num1`–`Num0` = **numpad** keys.
 
-## Configurar o PCSX2
+---
 
-1. Abre **Settings → Controllers**.
-2. Para **8 jogadores** precisas de **2 dispositivos Buzz** (cada um dá 4 comandos):
-   adiciona/atribui dois *Buzz Controllers* aos portos USB.
-3. Para cada Pad (1 a 8), mapeia os botões **buzzer / azul / laranja / verde /
-   amarelo** às teclas da tabela acima.
-4. Guarda. Põe o jogo Buzz a correr com a janela do PCSX2 em foco e testa.
+## Configuring PCSX2
 
-## Resolução de problemas
+1. Open **Settings → Controllers**.
+2. For **4 players**: click **USB Port 1**, choose **Buzz! Controller**, map players 1–4.
+3. For **8 players**: also click **USB Port 2**, choose **Buzz! Controller**, map players 5–8.
+4. For each pad, map **Buzzer / Blue / Orange / Green / Yellow** to the keys in the table above.
+5. Save and start the game with the PCSX2 window in focus.
 
-- **Os botões não fazem nada no jogo:** a janela do PCSX2 não está em foco, ou o
-  mapeamento no PCSX2 não corresponde à tabela.
-- **O telemóvel não abre a página:** confirma que está na mesma WiFi e que a
-  firewall permite a porta 3000.
-- **`npm install` falha no nut.js:** podem faltar ferramentas de build nativas do
-  Windows; reinstala o Node com a opção de *Tools for Native Modules* ativada.
+> ⚠️ **Buzz!: The Music Quiz** (the first game in the series) only supports 4 players.
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| Buttons do nothing in-game | PCSX2 window is not in focus, or key mapping doesn't match the table. |
+| Phone can't open the page | Make sure the phone is on the same WiFi and Windows Firewall allows port 3000. |
+| Remote tab shows "not found" | Click Install to download Cloudflare — or install it manually and restart BuzzCast. |
+| Remote QR never appears | Check that port 3000 is not blocked by a firewall or antivirus. |
