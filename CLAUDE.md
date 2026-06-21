@@ -1,0 +1,252 @@
+# BuzzCast — CLAUDE.md
+
+Virtual Buzz! quiz controllers on any phone for PCSX2. The app runs on the host PC, serves a web UI over the network, and emulates a keyboard so PCSX2 sees real keystrokes.
+
+GitHub: https://github.com/bacoinz/buzzcast  
+Distribution: `BuzzCast.exe` — standalone ~95 MB, no installs needed (Bun runtime embedded).
+
+---
+
+## Architecture
+
+```
+Phone (browser) ──WebSocket──► bun-server.js ──PowerShell SendKeys──► PCSX2 (focused window)
+                                     │
+                              Cloudflare Tunnel ──► remote phones (same lobby)
+```
+
+---
+
+## File map
+
+| File | Purpose |
+|------|---------|
+| `bun-server.js` | **Production server** (Bun). HTTP + WebSocket + keyboard emulation + Cloudflare. Always edit this for feature changes. |
+| `server.js` | Legacy Node.js + Express fallback. Uses nut.js for keyboard. Functionally equivalent but not the build target. |
+| `config.js` | Shared KEYMAP, PORT, PLAYERS (imported by server.js only; bun-server.js has them inlined). |
+| `build.js` | Build pipeline: reads public/ → patches bun-server.js source → writes _bundle.js → bun compile → embed icon. |
+| `package.json` | npm deps for the Node fallback only (express, ws, @nut-tree-fork/nut-js, qrcode). |
+| `public/index.html` | Lobby — 8-slot grid, real-time availability via WebSocket. |
+| `public/controller.html` | Controller UI — buzzer + 4 colour buttons. |
+| `public/instructions.html` | Bilingual instructions (EN/PT) + full key map table. |
+| `public/app.js` | Client WS logic: join, press, leave, name prompt, reconnect. |
+| `public/lang.js` | i18n system: T dict, getLang, setLang, t(), applyI18n(). |
+| `public/style.css` | All UI CSS: lobby, controller, instructions, responsive. |
+| `public/buzz-logo.png` | Logo (gitignored; must exist on disk to build exe). |
+| `public/buzz-logo-black.svg` | SVG logo embossed on buzzer button (gitignored). |
+| `controller-ico.png` | Source image for exe icon (gitignored). |
+| `buzz-logo.ico` | Generated ICO used during build (gitignored, auto-created by build.js). |
+
+---
+
+## Running / building
+
+```sh
+# Standalone exe (production)
+.\BuzzCast.exe                   # double-click; auto-opens /host in browser
+
+# Bun dev mode
+bun run bun-server.js
+
+# Node dev mode (needs images on disk)
+npm install && node server.js
+
+# Build exe (requires Bun installed + all images present on disk)
+bun run build.js                 # outputs BuzzCast.exe (~95 MB)
+```
+
+---
+
+## Key constants (bun-server.js, inlined)
+
+| Constant | Value |
+|----------|-------|
+| `PORT` | `3000` |
+| `PLAYERS` | `8` |
+| `CF_LOCAL` | `path.join(import.meta.dir, "cloudflared.exe")` |
+| `CF_URL` | `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe` |
+
+localStorage keys: `buzz_lang` (default `"en"`), `buzz_name`.
+
+---
+
+## WebSocket protocol
+
+All messages are JSON strings.
+
+| Direction | Type | Shape |
+|-----------|------|-------|
+| C → S | `join` | `{type, player: 1-8, name: string}` |
+| S → C | `join_result` | `{type, ok: true, player, name}` or `{type, ok: false, reason: "taken"\|"invalid slot"}` |
+| C → S | `press` | `{type, button: "buzzer"\|"blue"\|"orange"\|"green"\|"yellow"}` |
+| C → S | `leave` | `{type}` |
+| S → all | `slots` | `{type, taken: {1:bool,…,8:bool}, names: {1:string\|null,…}}` |
+
+`slots` is broadcast on: new connection, join, leave, disconnect.
+
+Server state:
+```js
+const slots = {};       // player(1-8) → ws | null
+const names = {};       // player(1-8) → string | null
+const wsClients = new Set();
+```
+
+---
+
+## API routes
+
+| Method | Path | Purpose | Response |
+|--------|------|---------|----------|
+| GET | `/` `/index.html` | Lobby page | HTML |
+| GET | `/controller.html` | Controller UI | HTML |
+| GET | `/instructions.html` | Instructions | HTML |
+| GET | `/style.css` `/app.js` `/lang.js` `/buzz-logo.png` `/buzz-logo-black.svg` | Static assets | file |
+| GET | `/host` | Host page (dynamic: LAN QR + tunnel UI) | HTML |
+| GET | `/api/tunnel-status` | Tunnel state | `{tunnelUrl, cfFound, cfInstalled, installing, installProgress, installError}` |
+| GET | `/api/qr?url=` | SVG QR for given URL | SVG |
+| POST | `/api/install-cloudflared` | Start async cloudflared download | `{ok:true}` |
+| POST | `/api/uninstall-cloudflared` | Delete cloudflared.exe, reset tunnel | `{ok:true}` |
+| POST | `/api/shutdown` | `process.exit(0)` after 300 ms | `{ok:true}` |
+
+---
+
+## Keyboard emulation (bun-server.js)
+
+A persistent PowerShell process is spawned at startup with stdin piped:
+
+```js
+const psProc = spawn("powershell", [
+  "-NoProfile", "-NonInteractive", "-Command",
+  "Add-Type -Assembly System.Windows.Forms; $r=[Console]::In; while(($l=$r.ReadLine()) -ne $null){if($l){[System.Windows.Forms.SendKeys]::SendWait($l)}}",
+], { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+```
+
+`tapKey(player, button)` → looks up `KEYMAP[player][button]` → maps via `SK` → writes `"q\n"` to stdin.
+
+```js
+const SK = {
+  Q:"q", W:"w", …,                        // letters: lowercase string
+  Num0:"{NUMPAD0}", …, Num9:"{NUMPAD9}",  // numpad: SendKeys braces
+  Comma:",", Period:".", Slash:"/",
+};
+```
+
+**Why PowerShell instead of nut.js?** Bun cannot load native `.node` modules. PowerShell's `SendKeys` is reliable for game input and has no external deps.
+
+**Requirement:** PCSX2 window must be in focus when a button is pressed.
+
+---
+
+## KEYMAP (8 players × 5 buttons = 40 unique keys)
+
+| Player | Buzzer | Blue | Orange | Green | Yellow |
+|-------:|:------:|:----:|:------:|:-----:|:------:|
+| 1 | Q | W | E | R | T |
+| 2 | A | S | D | F | G |
+| 3 | Z | X | C | V | B |
+| 4 | Y | U | I | O | P |
+| 5 | H | J | K | L | N |
+| 6 | Num1 | Num2 | Num3 | Num4 | Num5 |
+| 7 | Num6 | Num7 | Num8 | Num9 | Num0 |
+| 8 | M | F | , | . | / |
+
+Avoids F1–F12, Tab, Space, Esc (PCSX2 hotkeys).
+
+---
+
+## Cloudflare tunnel
+
+State variables (module-level globals):
+```js
+let tunnelUrl = null;   // null = not yet; string = active URL
+let cfFound = null;     // null = unknown, true = running, false = ENOENT
+let install = { running: false, progress: 0, error: null };
+```
+
+`startTunnel(cfPath?)`:
+- Spawns `cloudflared tunnel --url http://localhost:3000`
+- Regex-captures `https://[a-z0-9-]+\.trycloudflare\.com` from stdout/stderr
+- Sets `tunnelUrl` on first match; sets `cfFound` on spawn/error
+
+`downloadFile(url, dest, onProgress)`:
+- Follows HTTP redirects (max 10 hops) using Node `http`/`https`
+- Streams to `dest + ".tmp"`, renames on finish
+- Calls `onProgress(0-100)` per chunk
+
+Host page polls `/api/tunnel-status` every **1500 ms** and drives a state machine:
+`loading` → `not_found` → `installing (%)` → `error` → `QR shown`
+
+---
+
+## Build pipeline (build.js)
+
+1. Read all `public/` files into memory (PNG as base64)
+2. Read `bun-server.js` source as string
+3. **Patch ASSETS Map**: replace `Bun.file(new URL(...))` entries with `{body, type}` objects backed by embedded string/Buffer constants (`__S`)
+4. **Patch fetch handler**: `new Response(asset)` → `new Response(asset.body, {headers:{"Content-Type":asset.type}})`
+5. Write `_bundle.js`
+6. Run `bun build --compile _bundle.js --outfile BuzzCast.exe --icon buzz-logo.ico`
+7. Delete `_bundle.js`
+8. **Embed icon via Win32 API**: write `_embed-icon.ps1` (uses `BeginUpdateResource` / `UpdateResource` / `EndUpdateResource`), run it via `powershell -File`, delete it
+
+> **Why build.js exists:** `Bun.file(new URL("./public/...", import.meta.url))` in Bun 1.3.14 does **not** embed files at compile time — it tries to read from `B:\~BUN\root\...` at runtime and fails. All assets must be inlined as strings/buffers.
+
+> **Why a temp PS1 file for icon embedding:** PowerShell here-strings (`@'...'@`) cannot be passed inline via `-Command` (the `'@` must be at column 0). A temp file avoids this.
+
+---
+
+## i18n system
+
+### lang.js (used in public/ pages)
+
+```js
+const T = {
+  en: {
+    subtitle: "Choose your controller",
+    player_slot: n => `Player ${n}`,     // function keys
+    join_failed: r => `Could not join (${r}). Returning to menu.`,
+    // …
+  },
+  pt: { /* Portuguese */ }
+};
+
+function getLang()           // localStorage.getItem("buzz_lang") || "en"
+function setLang(lang)       // saves + location.reload()
+function t(key, ...args)     // lookup; if value is function, calls it with args
+function applyI18n()         // sets textContent on all [data-i18n]; activates .flag-btn
+```
+
+### Host page (bun-server.js)
+
+Has its own embedded `HOST_T` dict and `tx(key)` function (same pattern, different keys: `title`, `s1`–`s4`, `tab_local`, `tab_remote`, `tunnel_starting`, `not_found`, `install_btn`, `installing`, `install_error`, `retry_btn`).
+
+---
+
+## LAN IP detection
+
+```js
+function getLanIp() {
+  // Collects all non-internal IPv4 addresses
+  // CGNAT = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./   (avoid: unreliable for LAN)
+  // Private = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/
+  // Priority: private+non-CGNAT → non-CGNAT → first → "127.0.0.1"
+}
+```
+
+---
+
+## Gotchas
+
+- **Always edit `bun-server.js`** for production changes. `server.js` is legacy (Node + nut.js).
+- **Images are gitignored** (`*.png`, `*.svg`) but must exist on disk to run `build.js`. The exe has them embedded.
+- **`buzz-logo.ico`** is auto-generated by `build.js` from `controller-ico.png` via PowerShell .NET (`System.Drawing`) — multi-size ICO (256/128/64/48/32/16 px).
+- **WS protocol auto-detects transport:** `wss://` on HTTPS (Cloudflare tunnel), `ws://` on HTTP (local LAN).
+- **Name stored in localStorage** (`buzz_name`, max 20 chars). Sent with every `join` message including name changes.
+- **Slot re-join:** a client can re-join to change name or switch slots; old slot is freed automatically.
+- **Shutdown flow:** browser calls `POST /api/shutdown` → server does `setTimeout(() => process.exit(0), 300)` to allow response to send → browser calls `window.close()`.
+
+---
+
+## Gitignore summary
+
+Excluded: `node_modules/`, `BuzzCast.exe`, `cloudflared.exe`, `buzz-logo.ico`, `_bundle.js`, `_embed-icon.ps1`, `*.bun-build`, `.claude/`, `*.png`, `*.svg`
