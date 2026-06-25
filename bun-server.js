@@ -3,8 +3,10 @@ import os from "os";
 import fs from "fs";
 import https from "https";
 import http from "http";
-import { spawn, exec } from "child_process";
+import { spawn } from "child_process";
 import path from "path";
+import { initKeyboard, tapToken } from "./keyboard/index.js";
+import { openBrowser, CF as CFINFO, makeExecutable, extractTgz } from "./platform.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT) || 3000;
@@ -33,10 +35,10 @@ const ASSETS = new Map([
   ["/buzz-logo-black.svg", Bun.file(new URL("./public/buzz-logo-black.svg", import.meta.url))],
 ]);
 
-// ── PowerShell keyboard (replaces nut-js) ─────────────────────────────────────
-// Each KEYMAP key name maps to the literal character sent over stdin.
-// The PowerShell helper converts that char → virtual-key/scancode and injects it
-// via the Win32 keybd_event API (fire-and-forget, low latency, reliable for games).
+// ── Keyboard emulation (per-platform backend) ─────────────────────────────────
+// The actual OS key injection lives in ./keyboard/{windows,linux,macos}.js, picked
+// at runtime by ./keyboard/index.js. SK maps each KEYMAP key name to a "send token":
+// a single char, or "#XX" = raw key code in hex (e.g. "#08" = Backspace).
 const SK = {
   Q:"q", W:"w", E:"e", R:"r", T:"t",
   A:"a", S:"s", D:"d", F:"f", G:"g",
@@ -50,42 +52,48 @@ const SK = {
   Backspace:"#08",
 };
 
-const PS_KEY_SCRIPT = `Add-Type -Name K -Namespace W -MemberDefinition '[DllImport("user32.dll")]public static extern short VkKeyScan(char ch);[DllImport("user32.dll")]public static extern uint MapVirtualKey(uint c,uint t);[DllImport("user32.dll")]public static extern void keybd_event(byte vk,byte sc,uint f,System.UIntPtr e);';
-$Z=[System.UIntPtr]::Zero;
-$shSc=[byte]([W.K]::MapVirtualKey(0x10,0));
-$r=[Console]::In;
-while(($l=$r.ReadLine()) -ne $null){
-  if($l){
-    if($l[0] -eq '#'){
-      $vk=[Convert]::ToInt32($l.Substring(1),16);
-      $sc=[byte]([W.K]::MapVirtualKey([uint32]$vk,0));
-      [W.K]::keybd_event([byte]$vk,$sc,0x8,$Z);
-      [W.K]::keybd_event([byte]$vk,$sc,0xA,$Z);
-    } else {
-      $res=[W.K]::VkKeyScan($l[0]);
-      $vk=$res -band 0xff;
-      if($vk -ne 0xff){
-        $sh=($res -band 0x100) -ne 0;
-        $sc=[byte]([W.K]::MapVirtualKey([uint32]$vk,0));
-        if($sh){[W.K]::keybd_event(0x10,$shSc,0x8,$Z)}
-        [W.K]::keybd_event([byte]$vk,$sc,0x8,$Z);
-        [W.K]::keybd_event([byte]$vk,$sc,0xA,$Z);
-        if($sh){[W.K]::keybd_event(0x10,$shSc,0xA,$Z)}
+initKeyboard();
+
+// ── Effective keymap (editable + persisted) ───────────────────────────────────
+// player → button → "send token": a single char (typed via VkKeyScanW) or a raw
+// virtual-key in hex prefixed with "#" (e.g. "#08" = Backspace). Defaults derive
+// from KEYMAP + SK; the host "Keybinds" page can override and persist them.
+const BUTTONS = ["buzzer", "blue", "orange", "green", "yellow"];
+const KEYMAP_FILE = path.join(import.meta.dir, "keymap.json");
+
+function defaultKeymap() {
+  const km = {};
+  for (let p = 1; p <= PLAYERS; p++) {
+    km[p] = {};
+    for (const b of BUTTONS) km[p][b] = SK[KEYMAP[p][b]];
+  }
+  return km;
+}
+
+function sanitizeKeymap(input) {
+  const km = defaultKeymap();
+  if (input && typeof input === "object") {
+    for (let p = 1; p <= PLAYERS; p++) {
+      const src = input[p];
+      if (!src) continue;
+      for (const b of BUTTONS) {
+        const v = src[b];
+        if (typeof v === "string" && v.length >= 1 && v.length <= 4) km[p][b] = v;
       }
     }
   }
-}`;
+  return km;
+}
 
-const psProc = spawn("powershell", [
-  "-NoProfile", "-NonInteractive", "-Command", PS_KEY_SCRIPT,
-], { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
-psProc.on("error", (e) => console.error("[ps]", e.message));
+let keymap = defaultKeymap();
+try {
+  if (fs.existsSync(KEYMAP_FILE)) keymap = sanitizeKeymap(JSON.parse(fs.readFileSync(KEYMAP_FILE, "utf8")));
+} catch (e) { console.error("[keymap] load failed:", e.message); }
 
 function tapKey(player, button) {
-  const map = KEYMAP[player];
-  if (!map) return;
-  const sk = SK[map[button]];
-  if (sk && psProc.stdin) psProc.stdin.write(sk + "\n");
+  const km = keymap[player];
+  if (!km) return;
+  tapToken(km[button]);
 }
 
 // ── LAN IP ────────────────────────────────────────────────────────────────────
@@ -107,8 +115,8 @@ function getLanIp() {
 }
 
 // ── Cloudflare Tunnel ─────────────────────────────────────────────────────────
-const CF_LOCAL = path.join(import.meta.dir, "cloudflared.exe");
-const CF_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
+const CF_LOCAL = path.join(import.meta.dir, CFINFO.filename);
+const CF_URL = CFINFO.url;
 
 let tunnelUrl = null;
 let cfFound = null;
@@ -116,6 +124,7 @@ let install = { running: false, progress: 0, error: null };
 
 function startTunnel(cfPath) {
   if (!cfPath) cfPath = fs.existsSync(CF_LOCAL) ? CF_LOCAL : "cloudflared";
+  if (cfPath === CF_LOCAL) makeExecutable(cfPath);   // ensure +x on Linux/macOS
   tunnelUrl = null;
   const cf = spawn(cfPath, ["tunnel", "--url", `http://localhost:${PORT}`], {
     stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
@@ -216,6 +225,42 @@ async function hostPage() {
     .host-footer { position: fixed; bottom: 12px; left: 0; right: 0; text-align: center; opacity: 0.35; font-size: clamp(0.7rem, 1.1vw, 0.85rem); z-index: 80; }
     .host-footer a { color: #fff; text-decoration: none; }
     .host-footer a:hover { opacity: 0.7; }
+    /* Pill buttons (Keybinds + Instructions) */
+    .pill-btn { display: inline-flex; align-items: center; gap: 5px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); border-radius: 10px; color: rgba(255,255,255,0.8); font-size: clamp(0.7rem,1.1vw,0.85rem); font-weight: 600; padding: 5px 12px; text-decoration: none; cursor: pointer; transition: background 0.15s; white-space: nowrap; font-family: inherit; }
+    .pill-btn:hover { background: rgba(255,255,255,0.16); }
+    /* Keybinds modal */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(5,2,12,0.82); backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center; z-index: 200; padding: 3vh 2vw; }
+    .modal-overlay.show { display: flex; }
+    .modal { background: linear-gradient(180deg,#1c0d36,#100720); border: 1px solid rgba(255,255,255,0.12); border-radius: 18px; box-shadow: 0 20px 60px rgba(0,0,0,0.6); width: 100%; max-width: 1340px; max-height: 94vh; display: flex; flex-direction: column; }
+    .modal.modal-narrow { max-width: 640px; }
+    .instr-body { font-size: clamp(0.85rem,1.3vw,1rem); line-height: 1.5; color: rgba(255,255,255,0.88); }
+    .instr-body h4 { color: #ffd23f; font-size: clamp(0.95rem,1.5vw,1.15rem); margin: 18px 0 6px; }
+    .instr-body h4:first-child { margin-top: 0; }
+    .instr-body ol { margin: 0 0 4px 1.2em; display: flex; flex-direction: column; gap: 5px; }
+    .instr-body strong { color: #fff; }
+    .instr-body .notice { background: rgba(193,18,31,0.18); border: 1px solid rgba(255,80,80,0.4); border-radius: 10px; padding: 9px 13px; margin-bottom: 12px; font-size: clamp(0.78rem,1.15vw,0.92rem); }
+    .instr-body .tip { background: rgba(106,44,201,0.18); border: 1px solid rgba(168,85,247,0.4); border-radius: 10px; padding: 9px 13px; margin-top: 14px; font-size: clamp(0.78rem,1.15vw,0.92rem); }
+    .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 22px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+    .modal-head h3 { font-size: clamp(1.05rem,1.8vw,1.35rem); color: #ffd23f; font-weight: 800; }
+    .modal-hint { font-size: clamp(0.68rem,1vw,0.82rem); color: rgba(255,255,255,0.5); }
+    .modal-body { padding: 18px 22px; overflow: auto; }
+    .kb-grid { display: flex; gap: 14px; width: 100%; justify-content: center; }
+    .kb-player { flex: 1 1 0; min-width: 0; max-width: 116px; display: flex; flex-direction: column; align-items: center; gap: 9px; }
+    .kb-col { width: 100%; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 16px 12px; display: flex; flex-direction: column; align-items: center; gap: 11px; }
+    .kb-pnum { width: 30px; height: 30px; border-radius: 50%; background: linear-gradient(180deg,#6a2cc9,#4a1a99); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.9rem; }
+    .kb-ctrl { width: 100%; display: flex; justify-content: center; }
+    .kb-shape { cursor: pointer; transition: background 0.1s, box-shadow 0.1s; user-select: none; display: flex; align-items: center; justify-content: center; }
+    .kb-round { width: min(72px, 100%); aspect-ratio: 1; border-radius: 50%; border: 3px solid var(--c); }
+    .kb-rect { width: 100%; height: 34px; border-radius: 9px; border: 3px solid var(--c); }
+    .kb-shape.active { background: var(--c); box-shadow: 0 0 16px var(--c); }
+    .kb-input { width: 44px; text-align: center; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.22); border-radius: 7px; color: #fff; font-size: 0.85rem; font-weight: 800; padding: 5px 2px; cursor: pointer; font-family: inherit; }
+    .kb-input:focus, .kb-input.capturing { outline: none; border-color: #ffd23f; background: rgba(0,0,0,0.65); color: #ffd23f; box-shadow: 0 0 0 2px rgba(255,210,63,0.45); }
+    .modal-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 14px 22px; border-top: 1px solid rgba(255,255,255,0.1); }
+    .modal-foot .reset { margin-right: auto; }
+    .btn-primary, .btn-ghost { border: none; border-radius: 10px; font-size: clamp(0.8rem,1.2vw,0.95rem); font-weight: 700; padding: 9px 20px; cursor: pointer; font-family: inherit; transition: opacity 0.15s, background 0.15s; }
+    .btn-primary { background: linear-gradient(180deg,#6a2cc9,#4a1a99); color: #fff; }
+    .btn-ghost { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.85); }
+    .btn-primary:hover { opacity: 0.9; } .btn-ghost:hover { background: rgba(255,255,255,0.18); }
   </style>
 </head>
 <body>
@@ -233,7 +278,8 @@ async function hostPage() {
         <div class="step"><div class="step-num">4</div><div class="step-text" id="s4"></div></div>
       </div>
       <div class="lang-row">
-        <a href="/instructions.html" target="_blank" style="display:inline-flex;align-items:center;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:10px;color:rgba(255,255,255,0.75);font-size:clamp(0.7rem,1.1vw,0.85rem);font-weight:600;padding:5px 12px;text-decoration:none;transition:background 0.15s;white-space:nowrap" onmouseover="this.style.background='rgba(255,255,255,0.14)'" onmouseout="this.style.background='rgba(255,255,255,0.08)'">📋 PCSX2 Instructions</a>
+        <button class="pill-btn" id="kb-btn" onclick="openKeybinds()">🎮 <span id="kb-btn-label"></span></button>
+        <button class="pill-btn" id="instr-btn" onclick="openInstructions()">📋 <span id="instr-btn-label"></span></button>
         <button class="flag-btn" data-lang="en" onclick="setLang('en')" title="English">🇬🇧</button>
         <button class="flag-btn" data-lang="pt" onclick="setLang('pt')" title="Português">🇵🇹</button>
       </div>
@@ -256,10 +302,36 @@ async function hostPage() {
       </div>
     </div>
   </div>
+
+  <div class="modal-overlay" id="kb-modal">
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="kb-title"></h3>
+        <span class="modal-hint" id="kb-hint"></span>
+      </div>
+      <div class="modal-body"><div class="kb-grid" id="kb-grid"></div></div>
+      <div class="modal-foot">
+        <button class="btn-ghost reset" id="kb-reset" onclick="resetKeybinds()"></button>
+        <button class="btn-ghost" id="kb-back" onclick="closeKeybinds()"></button>
+        <button class="btn-primary" id="kb-save" onclick="saveKeybinds()"></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="instr-modal">
+    <div class="modal modal-narrow">
+      <div class="modal-head"><h3 id="instr-title"></h3></div>
+      <div class="modal-body instr-body" id="instr-content"></div>
+      <div class="modal-foot">
+        <button class="btn-primary" id="instr-close" onclick="closeInstructions()"></button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const HOST_T = {
-      en: { title:"How to join", s1:"Connect to the <strong>same WiFi</strong> as this PC.", s2:"Open your phone camera and scan the <strong>QR code →</strong>", s3:"Pick a free slot and enter your name.", s4:"Press the buttons and <strong>play!</strong>", tab_local:"Local", tab_remote:"Remote", tunnel_starting:"⏳ Starting tunnel…", not_found:"Cloudflared wasn't detected in your system, would you like to install? You can remove it later.", install_btn:"Install (≈35 MB)", installing:"Downloading cloudflared…", install_error:"Install failed:", retry_btn:"Retry" },
-      pt: { title:"Como entrar", s1:"Liga-te à <strong>mesma rede WiFi</strong> que este PC.", s2:"Aponta a câmara do telemóvel ao <strong>código QR →</strong>", s3:"Escolhe o teu lugar e escreve o teu nome.", s4:"Carrega nos botões e <strong>joga!</strong>", tab_local:"Local", tab_remote:"Remoto", tunnel_starting:"⏳ A iniciar túnel…", not_found:"O Cloudflared não foi detetado no sistema. Deseja instalar? Pode removê-lo mais tarde.", install_btn:"Instalar (≈35 MB)", installing:"A transferir cloudflared…", install_error:"Erro na instalação:", retry_btn:"Tentar novamente" }
+      en: { title:"How to join", s1:"Connect to the <strong>same WiFi</strong> as this PC.", s2:"Open your phone camera and scan the <strong>QR code →</strong>", s3:"Pick a free slot and enter your name.", s4:"Press the buttons and <strong>play!</strong>", tab_local:"Local", tab_remote:"Remote", tunnel_starting:"⏳ Starting tunnel…", not_found:"Cloudflared wasn't detected in your system, would you like to install? You can remove it later.", install_btn:"Install (≈35 MB)", installing:"Downloading cloudflared…", install_error:"Install failed:", retry_btn:"Retry", kb_btn:"Keybinds", instr_btn:"PCSX2 Instructions", kb_title:"Keybinds", kb_hint:"Click a key field and press the key you want · click a button to test it", kb_save:"Save", kb_back:"Back", kb_reset:"Reset defaults", instr_title:"PCSX2 Setup", instr_close:"Close" },
+      pt: { title:"Como entrar", s1:"Liga-te à <strong>mesma rede WiFi</strong> que este PC.", s2:"Aponta a câmara do telemóvel ao <strong>código QR →</strong>", s3:"Escolhe o teu lugar e escreve o teu nome.", s4:"Carrega nos botões e <strong>joga!</strong>", tab_local:"Local", tab_remote:"Remoto", tunnel_starting:"⏳ A iniciar túnel…", not_found:"O Cloudflared não foi detetado no sistema. Deseja instalar? Pode removê-lo mais tarde.", install_btn:"Instalar (≈35 MB)", installing:"A transferir cloudflared…", install_error:"Erro na instalação:", retry_btn:"Tentar novamente", kb_btn:"Teclas", instr_btn:"Instruções PCSX2", kb_title:"Configurar Teclas", kb_hint:"Clica num campo e prime a tecla que queres · clica num botão para testar", kb_save:"Guardar", kb_back:"Voltar", kb_reset:"Repor predefinições", instr_title:"Configurar PCSX2", instr_close:"Fechar" }
     };
     function getLang() { return localStorage.getItem("buzz_lang") || "en"; }
     function setLang(l) { localStorage.setItem("buzz_lang", l); location.reload(); }
@@ -273,8 +345,117 @@ async function hostPage() {
       document.getElementById("s4").innerHTML = t.s4;
       document.getElementById("tab-local").textContent = t.tab_local;
       document.getElementById("tab-remote").textContent = t.tab_remote;
+      document.getElementById("kb-btn-label").textContent = t.kb_btn;
+      document.getElementById("instr-btn-label").textContent = t.instr_btn;
+      document.getElementById("kb-title").textContent = t.kb_title;
+      document.getElementById("kb-hint").textContent = t.kb_hint;
+      document.getElementById("kb-save").textContent = t.kb_save;
+      document.getElementById("kb-back").textContent = t.kb_back;
+      document.getElementById("kb-reset").textContent = t.kb_reset;
+      document.getElementById("instr-title").textContent = t.instr_title;
+      document.getElementById("instr-close").textContent = t.instr_close;
       document.querySelectorAll(".flag-btn").forEach(b => b.classList.toggle("active", b.dataset.lang === getLang()));
     }
+
+    // ── PCSX2 instructions (popup) ──
+    const HOST_INSTR = {
+      en: '<div class="notice">⚠️ Works only with <strong>PCSX2</strong>. <strong>Buzz!: The Music Quiz</strong> (the first game) supports only 4 players, not 8.</div>'
+        + '<h4>1. Configure PCSX2 — up to 4 players</h4>'
+        + '<ol><li>In PCSX2 open <strong>Settings → Controllers</strong>.</li><li>Select <strong>USB Port 1</strong> and choose <strong>Buzz! Controller</strong>.</li><li>Map each button to the key shown in the <strong>🎮 Keybinds</strong> menu.</li></ol>'
+        + '<h4>2. For 5–8 players — add USB 2</h4>'
+        + '<ol><li>Still in <strong>Settings → Controllers</strong>, select <strong>USB Port 2</strong>.</li><li>Choose <strong>Buzz! Controller</strong> again and map players 5–8.</li></ol>'
+        + '<h4>3. Play</h4>'
+        + '<ol><li>Start the game in PCSX2.</li><li>Keep the <strong>PCSX2 window in focus</strong> — required to receive button presses.</li></ol>'
+        + '<div class="tip">💡 Open the <strong>🎮 Keybinds</strong> menu to see or change which keyboard key each button sends, then map the same keys in PCSX2.</div>',
+      pt: '<div class="notice">⚠️ Funciona apenas com o <strong>PCSX2</strong>. O <strong>Buzz!: The Music Quiz</strong> (o primeiro jogo) suporta apenas 4 jogadores, não 8.</div>'
+        + '<h4>1. Configurar o PCSX2 — até 4 jogadores</h4>'
+        + '<ol><li>No PCSX2 abre <strong>Settings → Controllers</strong>.</li><li>Seleciona <strong>USB Port 1</strong> e escolhe <strong>Buzz! Controller</strong>.</li><li>Mapeia cada botão para a tecla indicada no menu <strong>🎮 Teclas</strong>.</li></ol>'
+        + '<h4>2. Para 5–8 jogadores — adiciona USB 2</h4>'
+        + '<ol><li>Ainda em <strong>Settings → Controllers</strong>, seleciona <strong>USB Port 2</strong>.</li><li>Escolhe novamente <strong>Buzz! Controller</strong> e mapeia os jogadores 5–8.</li></ol>'
+        + '<h4>3. Jogar</h4>'
+        + '<ol><li>Inicia o jogo no PCSX2.</li><li>Mantém a <strong>janela do PCSX2 em foco</strong> — necessário para receber os botões.</li></ol>'
+        + '<div class="tip">💡 Abre o menu <strong>🎮 Teclas</strong> para ver ou alterar que tecla cada botão envia e mapeia as mesmas teclas no PCSX2.</div>'
+    };
+    function openInstructions() {
+      document.getElementById("instr-content").innerHTML = HOST_INSTR[getLang()] || HOST_INSTR.en;
+      document.getElementById("instr-modal").classList.add("show");
+    }
+    function closeInstructions() { document.getElementById("instr-modal").classList.remove("show"); }
+
+    // ── Keybinds editor ──
+    const KB_BUTTONS = [
+      { key:"buzzer", color:"#ff3b3b", shape:"round" },
+      { key:"blue",   color:"#2b6fd6", shape:"rect" },
+      { key:"orange", color:"#ff8c1a", shape:"rect" },
+      { key:"green",  color:"#33cc55", shape:"rect" },
+      { key:"yellow", color:"#ffd23f", shape:"rect" },
+    ];
+    const KEY_TO_VK = { Backspace:"#08", Tab:"#09", Enter:"#0d", Escape:"#1b", Delete:"#2e", Insert:"#2d", Home:"#24", End:"#23", PageUp:"#21", PageDown:"#22", ArrowLeft:"#25", ArrowUp:"#26", ArrowRight:"#27", ArrowDown:"#28" };
+    const VK_LABEL = { "#08":"⌫", "#09":"Tab", "#0d":"Enter", "#1b":"Esc", "#2e":"Del", "#2d":"Ins", "#24":"Home", "#23":"End", "#21":"PgUp", "#22":"PgDn", "#25":"←", "#26":"↑", "#27":"→", "#28":"↓" };
+    let kbData = null;
+    function flashShape(p, b) {
+      const el = document.querySelector('.kb-shape[data-player="' + p + '"][data-btn="' + b + '"]');
+      if (!el) return;
+      el.classList.add("active");
+      clearTimeout(el._t);
+      el._t = setTimeout(() => el.classList.remove("active"), 220);
+    }
+    function tokenLabel(tok) {
+      if (!tok) return "—";
+      if (tok[0] === "#") return VK_LABEL[tok] || ("VK" + tok.slice(1));
+      return tok === " " ? "Space" : tok.toUpperCase();
+    }
+    function keyToToken(e) {
+      if (e.key && e.key.length === 1) return e.key.toLowerCase();
+      return KEY_TO_VK[e.key] || null;
+    }
+    function buildKbGrid() {
+      const grid = document.getElementById("kb-grid");
+      grid.innerHTML = "";
+      for (let p = 1; p <= 8; p++) {
+        const wrap = document.createElement("div");
+        wrap.className = "kb-player";
+        wrap.innerHTML = '<div class="kb-pnum">' + p + '</div>';
+        const col = document.createElement("div");
+        col.className = "kb-col";
+        for (const b of KB_BUTTONS) {
+          const ctrl = document.createElement("div");
+          ctrl.className = "kb-ctrl";
+          const shape = document.createElement("div");
+          shape.className = "kb-shape " + (b.shape === "round" ? "kb-round" : "kb-rect");
+          shape.style.setProperty("--c", b.color);
+          shape.dataset.player = p; shape.dataset.btn = b.key;
+          shape.onclick = () => flashShape(p, b.key);
+          const inp = document.createElement("input");
+          inp.className = "kb-input"; inp.readOnly = true; inp.value = tokenLabel(kbData[p][b.key]);
+          inp.onclick = (e) => e.stopPropagation();
+          inp.onfocus = () => inp.classList.add("capturing");
+          inp.onblur = () => inp.classList.remove("capturing");
+          inp.onkeydown = (e) => {
+            e.preventDefault();
+            const tok = keyToToken(e);
+            if (!tok) return;
+            kbData[p][b.key] = tok; inp.value = tokenLabel(tok); inp.blur();
+          };
+          shape.appendChild(inp); ctrl.appendChild(shape); col.appendChild(ctrl);
+        }
+        wrap.appendChild(col);
+        grid.appendChild(wrap);
+      }
+    }
+    async function openKeybinds() {
+      kbData = await fetch("/api/keymap").then(r => r.json());
+      buildKbGrid();
+      document.getElementById("kb-modal").classList.add("show");
+    }
+    function closeKeybinds() { document.getElementById("kb-modal").classList.remove("show"); }
+    async function resetKeybinds() { kbData = await fetch("/api/keymap?defaults=1").then(r => r.json()); buildKbGrid(); }
+    async function saveKeybinds() {
+      await fetch("/api/keymap", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(kbData) });
+      closeKeybinds();
+    }
+    document.getElementById("kb-modal").addEventListener("click", (e) => { if (e.target.id === "kb-modal") closeKeybinds(); });
+    document.getElementById("instr-modal").addEventListener("click", (e) => { if (e.target.id === "instr-modal") closeInstructions(); });
     function switchTab(name) {
       ["local","remote"].forEach(n => {
         document.getElementById("tab-"+n).classList.toggle("active", n===name);
@@ -344,7 +525,7 @@ async function hostPage() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       const sws = new WebSocket(proto + "//" + location.host);
       sws.onmessage = (ev) => {
-        try { const m = JSON.parse(ev.data); if (m.type === "slots") renderPings(m.taken, m.names, m.pings); } catch {}
+        try { const m = JSON.parse(ev.data); if (m.type === "slots") renderPings(m.taken, m.names, m.pings); else if (m.type === "press") flashShape(m.player, m.button); } catch {}
       };
       sws.onclose = () => setTimeout(connectSpectator, 2000);
     }
@@ -397,7 +578,10 @@ Bun.serve({
     if (pathname === "/api/install-cloudflared" && req.method === "POST") {
       if (install.running) return Response.json({ ok: false, reason: "already running" });
       install = { running: true, progress: 0, error: null };
-      downloadFile(CF_URL, CF_LOCAL, (p) => { install.progress = p; })
+      // macOS ships cloudflared as a .tgz: download it, then extract the binary.
+      const dlTarget = CFINFO.isTgz ? CF_LOCAL + ".tgz" : CF_LOCAL;
+      downloadFile(CF_URL, dlTarget, (p) => { install.progress = p; })
+        .then(() => CFINFO.isTgz ? extractTgz(dlTarget, CF_LOCAL) : makeExecutable(CF_LOCAL))
         .then(() => { install.running = false; install.progress = 100; startTunnel(CF_LOCAL); })
         .catch((err) => { install.running = false; install.error = err.message; });
       return Response.json({ ok: true });
@@ -415,6 +599,17 @@ Bun.serve({
       const target = searchParams.get("url");
       if (!target) return new Response("", { status: 400 });
       return new Response(await genQr(target), { headers: { "Content-Type": "image/svg+xml" } });
+    }
+
+    if (pathname === "/api/keymap" && req.method === "GET")
+      return Response.json(searchParams.get("defaults") ? defaultKeymap() : keymap);
+
+    if (pathname === "/api/keymap" && req.method === "POST") {
+      try {
+        keymap = sanitizeKeymap(await req.json());
+        fs.writeFileSync(KEYMAP_FILE, JSON.stringify(keymap, null, 2));
+        return Response.json({ ok: true });
+      } catch (err) { return Response.json({ ok: false, error: err.message }); }
     }
 
     if (pathname === "/api/shutdown" && req.method === "POST") {
@@ -456,7 +651,11 @@ Bun.serve({
         ws.send(JSON.stringify({ type: "join_result", ok: true, player: p, name: names[p] }));
         broadcastSlots();
       } else if (data.type === "press") {
-        if (ws.data.player) tapKey(ws.data.player, data.button);
+        if (ws.data.player && BUTTONS.includes(data.button)) {
+          tapKey(ws.data.player, data.button);
+          const msg = JSON.stringify({ type: "press", player: ws.data.player, button: data.button });
+          for (const c of wsClients) c.send(msg);
+        }
       } else if (data.type === "ping") {
         ws.send(JSON.stringify({ type: "pong", t: data.t }));
       } else if (data.type === "latency") {
@@ -479,6 +678,6 @@ Bun.serve({
   },
 });
 
-exec(`cmd /c start http://localhost:${PORT}/host`);
+openBrowser(`http://localhost:${PORT}/host`);
 console.log(`BuzzCast running on http://localhost:${PORT}`);
 console.log(`Host: http://localhost:${PORT}/host`);

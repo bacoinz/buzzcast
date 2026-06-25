@@ -1,0 +1,120 @@
+name: Build & Release
+
+# Builds BuzzCast natively on Windows, Linux and macOS, then attaches the three
+# binaries to a GitHub Release. Triggered by pushing a tag like `v1.2`, or run
+# manually from the Actions tab.
+#
+# NOTE: the build embeds the brand images from public/ (buzz-logo.png,
+# buzz-logo-black.svg) and controller-ico.png. These are .gitignored by default —
+# they must be present in the repo for CI to build (commit them, or remove the
+# matching lines from .gitignore).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Windows ────────────────────────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build
+        shell: bash
+        run: bun run build.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: BuzzCast v*.exe
+
+  # ── Linux (raw binary + AppImage) ──────────────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build
+        run: bun run build.js
+      - name: Package AppImage
+        run: |
+          VER=$(bun -e 'console.log(require("./package.json").version)')
+          BIN="BuzzCast-v${VER}-linux-x86_64"
+          mkdir -p AppDir/usr/bin
+          cp "$BIN" AppDir/usr/bin/buzzcast
+          chmod +x AppDir/usr/bin/buzzcast
+          cp public/buzz-logo.png AppDir/buzzcast.png
+          cat > AppDir/buzzcast.desktop <<EOF
+          [Desktop Entry]
+          Name=BuzzCast
+          Exec=buzzcast
+          Icon=buzzcast
+          Type=Application
+          Categories=Game;
+          EOF
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE=$(dirname "$(readlink -f "$0")")
+          exec "$HERE/usr/bin/buzzcast" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir "BuzzCast-v${VER}-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            BuzzCast-v*-linux-x86_64
+            BuzzCast-v*-x86_64.AppImage
+
+  # ── macOS (unsigned .app + zip) ────────────────────────────────────────────
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build
+        run: bun run build.js
+      - name: Package .app
+        run: |
+          VER=$(bun -e 'console.log(require("./package.json").version)')
+          BIN="BuzzCast-v${VER}-macos"
+          APP="BuzzCast.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/BuzzCast"
+          chmod +x "$APP/Contents/MacOS/BuzzCast"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>BuzzCast</string>
+            <key>CFBundleExecutable</key><string>BuzzCast</string>
+            <key>CFBundleIdentifier</key><string>com.bacoinz.buzzcast</string>
+            <key>CFBundleVersion</key><string>${VER}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+          </dict></plist>
+          EOF
+          zip -r -y "BuzzCast-v${VER}-macos.zip" "$APP"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: BuzzCast-v*-macos.zip
+
+  # ── Release ────────────────────────────────────────────────────────────────
+  release:
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true

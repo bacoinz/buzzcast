@@ -1,14 +1,28 @@
 node_modules/
 BuzzCast.exe
 BuzzCast v*.exe
+BuzzCast-v*-linux-x86_64
+BuzzCast-v*-macos
+BuzzCast-v*-x86_64.AppImage
+BuzzCast-v*-macos.zip
+BuzzCast.app/
+cloudflared
 cloudflared.exe
+cloudflared*.tgz
 buzz-logo.ico
 _bundle.js
 _embed-icon.ps1
+AppDir/
+appimagetool
 *.tmp
 *.bun-build
 .claude/
 
-# Images (embedded in the exe at build time; not needed in the repo)
+# Images: ignore by default, but keep the brand assets the build/CI needs.
 *.png
 *.svg
+!public/buzz-logo.png
+!public/buzz-logo-black.svg
+!controller-ico.png
+!buzz-logo.ico
+keymap.json

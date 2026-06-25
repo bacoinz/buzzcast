@@ -7,9 +7,23 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pub = path.join(__dirname, "public");
 
-// ── Output name follows "BuzzCast v<version>.exe" (version from package.json) ──
+// ── Build target (version from package.json) ──────────────────────────────────
+// Native build by default; override with BUILD_TARGET=windows|linux|macos to
+// cross-compile from one machine. Icon embedding (Win32 UpdateResource) only runs
+// for the Windows target AND only when building on Windows.
 const { version } = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
-const EXE_NAME = `BuzzCast v${version}.exe`;
+
+const TARGETS = {
+  windows: { flag: "bun-windows-x64", out: `BuzzCast v${version}.exe`,            icon: true  },
+  linux:   { flag: "bun-linux-x64",   out: `BuzzCast-v${version}-linux-x86_64`,   icon: false },
+  macos:   { flag: process.arch === "arm64" ? "bun-darwin-arm64" : "bun-darwin-x64",
+             out: `BuzzCast-v${version}-macos`,                                    icon: false },
+};
+const which = process.env.BUILD_TARGET
+  || (process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux");
+const TARGET = TARGETS[which];
+if (!TARGET) { console.error(`Unknown BUILD_TARGET "${which}" (use windows|linux|macos)`); process.exit(1); }
+const EXE_NAME = TARGET.out;
 
 // ── Read static files ────────────────────────────────────────────────────────
 const indexHtml        = fs.readFileSync(path.join(pub, "index.html"),           "utf8");
@@ -79,17 +93,20 @@ const bundlePath = path.join(__dirname, "_bundle.js");
 fs.writeFileSync(bundlePath, src, "utf8");
 console.log("Generated _bundle.js");
 
-// 4. Compile
-console.log(`Compiling ${EXE_NAME}…`);
-execSync(`bun build --compile _bundle.js --outfile "${EXE_NAME}" --icon buzz-logo.ico`, { stdio: "inherit", cwd: __dirname });
+// 4. Compile (per target)
+const onWindows = process.platform === "win32";
+const icoPath = path.join(__dirname, "buzz-logo.ico");
+const useIcon = TARGET.icon && onWindows && fs.existsSync(icoPath);
+const iconFlag = useIcon ? " --icon buzz-logo.ico" : "";
+console.log(`Compiling ${EXE_NAME} (target ${TARGET.flag})…`);
+execSync(`bun build --compile --target=${TARGET.flag} _bundle.js --outfile "${EXE_NAME}"${iconFlag}`, { stdio: "inherit", cwd: __dirname });
 
 // 5. Cleanup
 fs.unlinkSync(bundlePath);
 
-// 6. Embed icon via Win32 UpdateResource (write PS1 to temp file to avoid here-string issues)
+// 6. Embed icon via Win32 UpdateResource (Windows target, built on Windows only)
 const exePath = path.join(__dirname, EXE_NAME);
-const icoPath = path.join(__dirname, "buzz-logo.ico");
-if (fs.existsSync(icoPath)) {
+if (useIcon) {
   console.log("Embedding icon…");
   const ps1Path = path.join(__dirname, "_embed-icon.ps1");
   fs.writeFileSync(ps1Path, `
