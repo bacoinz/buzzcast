@@ -21,9 +21,11 @@ Phone (browser) ──WebSocket──► BuzzCast on PC ──keyboard emulation
 - **Up to 8 players** on their own phones — no apps, no pairing.
 - **Local or remote** play (LAN QR code or Cloudflare Tunnel for online).
 - **Low-latency keyboard injection**, layout-aware, native per OS (Windows `keybd_event`, Linux X11 `XTest`, macOS CoreGraphics).
-- **Customisable keys** — change any pad's key from the host's **Keybinds** menu; defaults below.
+- **Customisable keys** — change any pad's key from the host's **Keybinds** menu (with live test feedback); defaults below.
 - **Live latency indicator** per player, on both the controller and the host screen.
 - **Auto-reconnect** with exponential backoff if WiFi drops.
+- **Screen stays awake** — the controller holds a wake lock so phones don't dim mid-game.
+- **Update notifications** — the host checks GitHub and shows a banner when a new version is out.
 
 ---
 
