@@ -32,7 +32,7 @@ Phone (browser) ──WebSocket──► BuzzCast on PC ──keyboard emulation
 - **Up to 8 players** on their own phones (7 on RPCS3) — no apps, no pairing.
 - **Local or remote** play (LAN QR code or Cloudflare Tunnel for online).
 - **Works with PCSX2 and RPCS3** — setup steps for both are in the host's **Emulator Instructions** popup.
-- **Low-latency keyboard injection**, layout-aware, native per OS (Windows `keybd_event`, Linux X11 `XTest`, macOS CoreGraphics).
+- **Low-latency keyboard injection**, layout-aware, native per OS (Windows `keybd_event`, Linux Wayland `uinput` / X11 `XTest`, macOS CoreGraphics).
 - **Customisable keys** — change any pad's key from the host's **Keybinds** menu (with live test feedback); defaults below.
 - **Live latency indicator** per player, on both the controller and the host screen.
 - **Auto-reconnect** with exponential backoff if WiFi drops.
@@ -46,7 +46,7 @@ Phone (browser) ──WebSocket──► BuzzCast on PC ──keyboard emulation
 - A **Windows, macOS or Linux PC** running **PCSX2** (PS2) or **RPCS3** (PS3) with a Buzz! game.
 - Phones on the **same WiFi** as the PC (for local play).
 - No installs needed on phones — just a browser.
-- Linux: an **X11** session (Wayland not yet supported) with `libxtst6` installed. macOS: grant **Accessibility** permission when asked.
+- Linux: an **X11 or Wayland** session. Wayland injects through a virtual keyboard (`/dev/uinput`; most desktops grant the logged-in user access), X11 needs `libxtst6`. macOS: grant **Accessibility** permission when asked.
 
 > **No Node.js or Bun required.** The BuzzCast download is a standalone executable that includes its own runtime. Just run it and play.
 
@@ -180,6 +180,8 @@ The same files are also in the [`profiles/`](profiles) folder of this repo.
 
 > Applying a profile replaces your current PCSX2 bindings and hotkeys (PCSX2 asks first). The BuzzCast profile also frees the **`.`** key, which PCSX2 uses by default for *Turbo / Fast Forward (Hold)* but BuzzCast sends for player 8's green.
 
+> ⚠️ **Buzz! Junior games (PCSX2):** the Junior titles read the Buzz! controller from **USB Port 2**. If the profile is applied and the keys map fine but the buttons do nothing only in a Junior game, use **USB Port 2 for players 1–4** and **USB Port 1 for players 5–8** — or swap the `[USB1]` and `[USB2]` sections in `BuzzCast.ini`. Tested with PCSX2 2.9.143 and *Buzz! Junior: Monster Rumble*.
+
 **RPCS3**
 1. Open **Configuration → Input/Output**, set **Buzz! Emulated Controller** to **1 controller (1-4 players)** or **2 controllers (5-7 players)**, then **Apply** and **Save** (this one setting isn't part of the profile).
 2. Open **Configuration → Devices → Pads**, choose **BuzzCast** under **Configuration Files** and click **Save**.
@@ -229,8 +231,9 @@ RPCS3's emulated Buzz! controllers read each player's **pad**, so keys are mappe
 | The emulator picks up the key while mapping, but nothing happens in-game | Update to **v1.4** or later. v1.0–v1.3 released each key after <1 ms, faster than PCSX2/RPCS3 read the Buzz! pad; keys are now held for ~80 ms. |
 | PCSX2 fast-forwards when player 8 presses green | PCSX2's default *Turbo / Fast Forward (Hold)* hotkey is `.`, player 8's green. Apply the BuzzCast profile, or clear that hotkey in **Settings → Hotkeys**. |
 | Buttons do nothing in-game (Windows, emulator run as administrator) | Windows blocks simulated keys from a normal app to an admin app. Run BuzzCast and the emulator the same way (both normal, or both as administrator). |
+| Buzz! Junior: buttons do nothing in-game (PCSX2) | Junior games read the Buzz! controller from **USB Port 2** — map players 1–4 to USB Port 2 (or swap the `[USB1]`/`[USB2]` sections in `BuzzCast.ini`). |
 | Phone can't open the page | Make sure the phone is on the same WiFi and your firewall allows port 3000. |
-| Buttons do nothing (Linux) | Needs an **X11** session (not Wayland) with `libxtst6` installed. |
+| Buttons do nothing (Linux) | Needs an **X11 or Wayland** session. On Wayland, BuzzCast creates a virtual keyboard via `/dev/uinput`; if nothing happens, check the startup log for `uinput unavailable` and allow `/dev/uinput` (udev `uaccess` rule). On X11, install `libxtst6`. |
 | Buttons do nothing (macOS) | Grant **Accessibility** permission: System Settings → Privacy & Security → Accessibility. |
 | Remote tab shows "not found" | Click Install to download Cloudflare — or install it manually (on `PATH` or next to BuzzCast) and restart BuzzCast. |
 | Phone shows "Forbidden — host only" | The Host page only opens on the PC running BuzzCast. Players should use the lobby link / QR code. |
@@ -243,7 +246,7 @@ RPCS3's emulated Buzz! controllers read each player's **pad**, so keys are mappe
 
 BuzzCast was developed and tested on **Windows**. The **macOS** and **Linux** builds compile and ship, but the keyboard injection on those platforms hasn't been verified on real hardware yet. If you try them, please [open an issue](https://github.com/bacoinz/buzzcast/issues) with your OS/version and whether the buttons worked — it's a huge help. 🙏
 
-Known caveats: Linux is **X11-only** (Wayland not supported) and needs `libxtst6`; macOS needs **Accessibility** permission and the app is **unsigned** (right-click → Open).
+Known caveats: Linux uses **XTEST** on X11 (needs `libxtst6`) and **uinput** on Wayland (needs `/dev/uinput` access); macOS needs **Accessibility** permission and the app is **unsigned** (right-click → Open).
 
 ---
 
