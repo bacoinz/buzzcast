@@ -247,4 +247,12 @@ Known caveats: Linux is **X11-only** (Wayland not supported) and needs `libxtst6
 
 ---
 
+## License
+
+BuzzCast is released under the [MIT License](LICENSE).
+
+BuzzCast is an unofficial fan project, not affiliated with or endorsed by Sony Interactive Entertainment. *Buzz!* is a trademark of Sony Interactive Entertainment; PCSX2 and RPCS3 belong to their respective projects.
+
+---
+
 Built with [Bun](https://bun.sh).
